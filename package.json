@@ -1,0 +1,11 @@
+{
+  "name": "meyar-clarity",
+  "version": "0.2.0",
+  "description": "Meyar Clarity local Figma plugin with AI audit backend",
+  "main": "code.js",
+  "scripts": {
+    "start:backend": "node server.js"
+  },
+  "author": "",
+  "license": "UNLICENSED"
+}
