@@ -1,10 +1,10 @@
 # Security
 
-## API Keys
+## Secrets
 
-Never commit API keys, tokens, private backend URLs, or private design data.
+Never commit tokens, private URLs, or private design data.
 
-If a key is accidentally committed, revoke it immediately from the provider dashboard and create a new one.
+If a secret is accidentally committed, revoke it immediately from the provider dashboard and create a new one.
 
 ## Reporting Issues
 
@@ -12,4 +12,4 @@ For privacy or security issues, contact the maintainer privately before opening 
 
 ## Data Handling
 
-Meyar Clarity's free version is designed around local heuristic review and optional bring-your-own-key AI. Hosted AI should only be added with authentication, rate limits, billing controls, and clear privacy terms.
+Meyar Clarity is designed around local heuristic review. Any future networked feature should only be added with authentication, rate limits, billing controls, and clear privacy terms.

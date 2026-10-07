@@ -4,14 +4,13 @@ Use this checklist before making the repository public.
 
 ## Required
 
-- [ ] Confirm no real API keys are committed.
+- [ ] Confirm no real secrets are committed.
 - [ ] Confirm `.env` files are ignored.
-- [ ] Confirm `README.md` describes local mode and optional BYOK AI mode.
-- [ ] Confirm `PRIVACY.md` explains what frame data is read and sent.
+- [ ] Confirm `README.md` describes local mode.
+- [ ] Confirm `PRIVACY.md` explains what frame data is read.
 - [ ] Confirm `LICENSE` is included.
 - [ ] Confirm `manifest.json` imports successfully in Figma Desktop.
-- [ ] Confirm plugin works with no backend running.
-- [ ] Confirm plugin works with backend running.
+- [ ] Confirm plugin works without any companion service.
 - [ ] Confirm generated notes and report frame work.
 - [ ] Add screenshots to GitHub after taking fresh screenshots in Figma.
 
@@ -27,7 +26,6 @@ Use this checklist before making the repository public.
   - `saas`
   - `accessibility`
   - `design-systems`
-  - `openai`
 
 ## First Git Commands
 
@@ -42,7 +40,7 @@ git push -u origin main
 
 ## Before Sharing Publicly
 
-- [ ] Rotate any API key that was previously pasted into chat or logs.
+- [ ] Rotate any secret that was previously pasted into chat or logs.
 - [ ] Add 3-5 screenshots to the README.
 - [ ] Add a short demo GIF or video if possible.
 - [ ] Create GitHub issues for roadmap items.

@@ -16,15 +16,14 @@ Good first contributions:
 1. Clone the repository.
 2. Import `manifest.json` in Figma Desktop through `Plugins > Development > Import plugin from manifest...`.
 3. Run the plugin against a selected frame.
-4. Optional: run the local backend with `npm run start:backend`.
 
 ## Pull Request Guidelines
 
 - Keep changes focused.
-- Do not commit API keys or private design data.
+- Do not commit tokens or private design data.
 - Add clear before/after notes for UI changes.
 - Prefer small, understandable heuristic improvements.
-- Keep privacy and cost control in mind.
+- Keep privacy in mind.
 
 ## Security
 
