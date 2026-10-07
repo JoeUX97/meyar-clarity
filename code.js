@@ -375,8 +375,127 @@ function runLocalAudit(config) {
   };
 }
 
+function safeJsonFromText(text) {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) throw error;
+    return JSON.parse(match[0]);
+  }
+}
+
+function normalizeAIFinding(finding, index, fallbackNodeId, fallbackLayerName) {
+  const severity = ["must", "should", "consider"].includes(finding.severity) ? finding.severity : "should";
+  return {
+    id: finding.id || `AI-${String(index + 1).padStart(3, "0")}`,
+    severity,
+    category: finding.category || "Clarity",
+    title: finding.title || "Review finding",
+    layerId: finding.layerId || fallbackNodeId,
+    layerName: finding.layerName || fallbackLayerName,
+    confidence: finding.confidence || "Medium",
+    recommendation: finding.recommendation || "Clarify this area before handoff.",
+    why: finding.why || "This may affect clarity, confidence, or speed for SaaS users.",
+    evidence: Array.isArray(finding.evidence) && finding.evidence.length ? finding.evidence.slice(0, 3) : ["AI review based on selected frame summary"]
+  };
+}
+
+function buildOpenAIPrompt(config, localAudit) {
+  const summary = localAudit.summary;
+  return [
+    "You are Meyar Clarity, a senior B2B SaaS UX reviewer inside Figma.",
+    "Review the selected screen for UX clarity, complexity, hierarchy, missing states, accessibility basics, and handoff risk.",
+    "Return only valid JSON. Do not include markdown.",
+    "Use this exact JSON shape:",
+    "{\"score\":number,\"complexity\":\"Low|Medium|High|Critical\",\"findings\":[{\"severity\":\"must|should|consider\",\"category\":\"string\",\"title\":\"string\",\"layerId\":\"string\",\"layerName\":\"string\",\"confidence\":\"Low|Medium|High\",\"recommendation\":\"string\",\"why\":\"string\",\"evidence\":[\"string\"]}]}",
+    "Keep findings practical, specific, and useful for product designers. Prefer 5 to 8 findings.",
+    `Product type: ${config.productType || "SaaS product"}`,
+    `User role: ${config.userRole || "End user"}`,
+    `Strictness: ${config.strictness || "Balanced"}`,
+    `Frame: ${summary.frameName}, size ${summary.width}x${summary.height}, visible layers ${summary.layers}`,
+    `Detected patterns: ${(summary.patterns || []).join(", ")}`,
+    `Text samples: ${summary.textLayers.map((layer) => `${layer.name}: ${layer.characters}`).slice(0, 35).join(" | ")}`,
+    `Action layers: ${(summary.actionNodes || []).map((node) => `${node.name} (${node.type})`).slice(0, 16).join(" | ")}`,
+    `Local findings to consider: ${localAudit.findings.map((finding) => `${finding.severity}: ${finding.title} - ${finding.recommendation}`).slice(0, 7).join(" | ")}`
+  ].join("\n");
+}
+
+async function getStoredApiKey() {
+  return (await figma.clientStorage.getAsync("meyar-openai-api-key")) || "";
+}
+
+async function callOpenAI(apiKey, config, localAudit) {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      max_tokens: 1800,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: "You are a concise expert UX auditor for B2B SaaS Figma screens. Return only valid JSON."
+        },
+        {
+          role: "user",
+          content: buildOpenAIPrompt(config, localAudit)
+        }
+      ]
+    })
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = body && body.error && body.error.message ? body.error.message : `OpenAI returned ${response.status}`;
+    throw new Error(message);
+  }
+
+  const content = body.choices && body.choices[0] && body.choices[0].message ? body.choices[0].message.content : "";
+  const parsed = safeJsonFromText(content);
+  const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+
+  return {
+    ...localAudit,
+    score: typeof parsed.score === "number" ? Math.max(0, Math.min(100, Math.round(parsed.score))) : localAudit.score,
+    complexity: ["Low", "Medium", "High", "Critical"].includes(parsed.complexity) ? parsed.complexity : localAudit.complexity,
+    findings: findings.length
+      ? findings.slice(0, 8).map((finding, index) => normalizeAIFinding(finding, index, localAudit.summary.nodeId, localAudit.summary.frameName))
+      : localAudit.findings,
+    mode: "Use my API key",
+    aiMessage: "AI review completed with your API key."
+  };
+}
+
 async function runAudit(config) {
   const localAudit = runLocalAudit(config);
+
+  if (!config || config.auditMode === "local") {
+    return {
+      ...localAudit,
+      mode: "Free local"
+    };
+  }
+
+  if (config.auditMode === "api") {
+    try {
+      const apiKey = await getStoredApiKey();
+      if (!apiKey) throw new Error("Add your OpenAI API key first.");
+      return await callOpenAI(apiKey, config, localAudit);
+    } catch (error) {
+      return {
+        ...localAudit,
+        mode: "Free local",
+        aiUnavailable: true,
+        aiMessage: error && error.message ? error.message : "AI review unavailable. Using local review."
+      };
+    }
+  }
 
   try {
     const response = await fetch("http://localhost:8787/audit", {
@@ -404,7 +523,7 @@ async function runAudit(config) {
     return {
       ...result.audit,
       summary: localAudit.summary,
-      mode: "AI audit",
+      mode: config.auditMode === "cloud" ? "Meyar Cloud" : "Use my API key",
       backendMessage: "AI backend connected."
     };
   } catch (error) {
@@ -477,53 +596,326 @@ async function createAnnotation(finding) {
   figma.notify("Meyar Clarity note added.");
 }
 
+const MEYAR_LOGO_BASE64 = "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";
+
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function makeLogoNode(width, height) {
+  const logo = figma.createRectangle();
+  logo.name = "Meyar logo";
+  logo.resize(width, height);
+  const image = figma.createImage(base64ToBytes(MEYAR_LOGO_BASE64));
+  logo.fills = [{ type: "IMAGE", imageHash: image.hash, scaleMode: "FIT" }];
+  return logo;
+}
+function rgb(hex) {
+  const clean = hex.replace("#", "");
+  return {
+    r: parseInt(clean.slice(0, 2), 16) / 255,
+    g: parseInt(clean.slice(2, 4), 16) / 255,
+    b: parseInt(clean.slice(4, 6), 16) / 255
+  };
+}
+
+function severityLabelForReport(severity) {
+  if (severity === "must") return "High";
+  if (severity === "should") return "Medium";
+  return "Low";
+}
+
+function severityColors(severity) {
+  if (severity === "must") return { text: "#8f1d18", fill: "#f7e7e4", dot: "#b42318" };
+  if (severity === "should") return { text: "#765000", fill: "#f4ead2", dot: "#c98200" };
+  return { text: "#23543a", fill: "#e5f0e9", dot: "#276749" };
+}
+
+async function makeText(characters, options = {}) {
+  const text = figma.createText();
+  text.fontName = { family: "Inter", style: options.bold ? "Bold" : "Regular" };
+  text.fontSize = options.size || 12;
+  text.lineHeight = { value: options.lineHeight || Math.round((options.size || 12) * 1.35), unit: "PIXELS" };
+  text.characters = String(characters || "");
+  text.fills = [{ type: "SOLID", color: rgb(options.color || "#111111") }];
+  if (options.width) text.resize(options.width, text.height);
+  return text;
+}
+
+function makeFrame(name, options = {}) {
+  const frame = figma.createFrame();
+  frame.name = name;
+  frame.fills = [{ type: "SOLID", color: rgb(options.fill || "#ffffff") }];
+  frame.strokes = options.stroke === false ? [] : [{ type: "SOLID", color: rgb(options.stroke || "#e7e5e1") }];
+  frame.cornerRadius = options.radius === undefined ? 8 : options.radius;
+  frame.layoutMode = options.layout || "VERTICAL";
+  frame.itemSpacing = options.gap === undefined ? 8 : options.gap;
+  frame.paddingTop = options.paddingTop === undefined ? options.padding || 12 : options.paddingTop;
+  frame.paddingRight = options.paddingRight === undefined ? options.padding || 12 : options.paddingRight;
+  frame.paddingBottom = options.paddingBottom === undefined ? options.padding || 12 : options.paddingBottom;
+  frame.paddingLeft = options.paddingLeft === undefined ? options.padding || 12 : options.paddingLeft;
+  if (options.width && options.height) frame.resize(options.width, options.height);
+  else if (options.width) frame.resize(options.width, frame.height);
+  frame.primaryAxisSizingMode = options.primarySizing || (frame.layoutMode === "HORIZONTAL" && options.width ? "FIXED" : "AUTO");
+  frame.counterAxisSizingMode = options.counterSizing || (frame.layoutMode === "VERTICAL" && options.width ? "FIXED" : "AUTO");
+  return frame;
+}
+
+async function makePill(label, options = {}) {
+  const pill = makeFrame(`Pill - ${label}`, {
+    fill: options.fill || "#f3f2ef",
+    stroke: false,
+    radius: 999,
+    layout: "HORIZONTAL",
+    counterSizing: "AUTO",
+    paddingTop: 6,
+    paddingRight: 10,
+    paddingBottom: 6,
+    paddingLeft: 10,
+    gap: 6
+  });
+
+  if (options.dot) {
+    const dot = figma.createEllipse();
+    dot.name = "Severity dot";
+    dot.resize(7, 7);
+    dot.fills = [{ type: "SOLID", color: rgb(options.dot) }];
+    pill.appendChild(dot);
+  }
+
+  pill.appendChild(await makeText(label, { size: 11, bold: true, color: options.color || "#111111" }));
+  return pill;
+}
+
+async function makeSummaryCard(label, value, detail, width, tone = {}) {
+  const card = makeFrame(`Summary - ${label}`, {
+    width,
+    fill: tone.fill || "#ffffff",
+    stroke: tone.stroke || "#e7e5e1",
+    paddingTop: 18,
+    paddingRight: 18,
+    paddingBottom: 18,
+    paddingLeft: 18,
+    gap: 10
+  });
+  const top = makeFrame(`${label} top`, { width: width - 36, fill: tone.fill || "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", padding: 0, gap: 8 });
+  top.primaryAxisAlignItems = "SPACE_BETWEEN";
+  top.counterAxisAlignItems = "CENTER";
+  top.appendChild(await makeText(label, { size: 13, bold: true, color: tone.label || "#111111" }));
+  if (tone.dot) {
+    const dot = figma.createEllipse();
+    dot.name = `${label} accent`;
+    dot.resize(8, 8);
+    dot.fills = [{ type: "SOLID", color: rgb(tone.dot) }];
+    top.appendChild(dot);
+  }
+  card.appendChild(top);
+  card.appendChild(await makeText(value, { size: 30, bold: true, color: tone.value || "#111111" }));
+  card.appendChild(await makeText(detail, { size: 12, color: tone.detail || "#555555", width: width - 36, lineHeight: 17 }));
+  return card;
+}
+
+async function makeFindingRow(finding, widths, isHeader = false) {
+  const row = makeFrame(isHeader ? "Findings table header" : `Finding row - ${finding.title}`, {
+    width: widths.reduce((sum, width) => sum + width, 0),
+    fill: isHeader ? "#fafafa" : "#ffffff",
+    stroke: false,
+    radius: 0,
+    layout: "HORIZONTAL",
+    padding: 0,
+    gap: 0
+  });
+
+  const cells = isHeader
+    ? ["Severity", "Finding", "Evidence", "Recommendation", "Layer"]
+    : [severityLabelForReport(finding.severity), finding.title, (finding.evidence || [""])[0], finding.recommendation, finding.layerName];
+
+  for (let index = 0; index < cells.length; index += 1) {
+    const cell = makeFrame(`Cell ${index + 1}`, {
+      width: widths[index],
+      fill: isHeader ? "#fafafa" : "#ffffff",
+      stroke: false,
+      radius: 0,
+      paddingTop: 12,
+      paddingRight: 10,
+      paddingBottom: 12,
+      paddingLeft: 10,
+      gap: 0
+    });
+
+    if (!isHeader && index === 0) {
+      const colors = severityColors(finding.severity);
+      cell.appendChild(await makePill(cells[index], colors));
+    } else {
+      cell.appendChild(await makeText(cells[index], {
+        size: isHeader ? 11 : 11.5,
+        bold: isHeader || index === 1,
+        color: isHeader ? "#666666" : "#222222",
+        width: widths[index] - 20,
+        lineHeight: isHeader ? 15 : 16
+      }));
+    }
+
+    row.appendChild(cell);
+  }
+
+  return row;
+}
+
+async function makeStateRow(rowData) {
+  const row = makeFrame(`State - ${rowData.name}`, {
+    width: 500,
+    fill: "#ffffff",
+    stroke: false,
+    radius: 0,
+    layout: "HORIZONTAL",
+    paddingTop: 6,
+    paddingRight: 0,
+    paddingBottom: 6,
+    paddingLeft: 0,
+    gap: 8
+  });
+  row.appendChild(await makeText(rowData.name, { size: 12, color: "#333333", width: 300 }));
+  const value = [rowData.table, rowData.form, rowData.billing].includes("Missing") ? "Missing" : [rowData.table, rowData.form, rowData.billing].includes("Unclear") ? "Unclear" : "Present";
+  const colors = value === "Missing" ? { color: "#8f1d18", fill: "#f7e7e4", dot: "#b42318" } : value === "Unclear" ? { color: "#765000", fill: "#f4ead2", dot: "#c98200" } : { color: "#23543a", fill: "#e5f0e9", dot: "#276749" };
+  row.appendChild(await makePill(value, colors));
+  return row;
+}
+
 async function createReport(data) {
   await figma.loadFontAsync({ family: "Inter", style: "Regular" });
   await figma.loadFontAsync({ family: "Inter", style: "Bold" });
 
-  const report = figma.createFrame();
-  report.name = "Meyar Clarity audit summary";
-  report.resize(720, 520);
-  report.fills = [{ type: "SOLID", color: { r: 1, g: 1, b: 1 } }];
-  report.strokes = [{ type: "SOLID", color: { r: 0.86, g: 0.88, b: 0.92 } }];
-  report.cornerRadius = 12;
-  report.layoutMode = "VERTICAL";
-  report.paddingTop = 32;
-  report.paddingRight = 32;
-  report.paddingBottom = 32;
-  report.paddingLeft = 32;
-  report.itemSpacing = 18;
+  const findings = data.findings || [];
+  const highCount = findings.filter((finding) => finding.severity === "must").length;
+  const mediumCount = findings.filter((finding) => finding.severity === "should").length;
+  const lowCount = findings.filter((finding) => finding.severity !== "must" && finding.severity !== "should").length;
+  const frameName = data.summary && data.summary.frameName ? data.summary.frameName : "Selected frame";
+  const mode = data.mode || "Free local review";
 
-  const title = figma.createText();
-  title.fontName = { family: "Inter", style: "Bold" };
-  title.fontSize = 26;
-  title.characters = `Meyar Clarity audit: ${data.summary.frameName}`;
+  const report = makeFrame("Meyar Clarity - Review summary", {
+    width: 1280,
+    fill: "#ffffff",
+    stroke: "#d9d7d2",
+    radius: 10,
+    paddingTop: 28,
+    paddingRight: 28,
+    paddingBottom: 22,
+    paddingLeft: 28,
+    gap: 18
+  });
 
-  const meta = figma.createText();
-  meta.fontName = { family: "Inter", style: "Regular" };
-  meta.fontSize = 14;
-  meta.characters = `Score ${data.score}/100 - Complexity ${data.complexity} - ${data.findings.length} findings`;
+  const header = makeFrame("Report header", { width: 1224, fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", padding: 0, gap: 0 });
+  header.primaryAxisAlignItems = "SPACE_BETWEEN";
+  header.counterAxisAlignItems = "CENTER";
+  const brand = makeFrame("Brand", { fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", counterSizing: "AUTO", padding: 0, gap: 10 });
+  const logo = makeLogoNode(132, 32);
+  brand.appendChild(logo);
+  header.appendChild(brand);
+  header.appendChild(await makeText(`${frameName}   |   SaaS product   |   ${mode}   |   Oct 2026`, { size: 11, color: "#666666", width: 460 }));
+  report.appendChild(header);
 
-  const list = figma.createText();
-  list.fontName = { family: "Inter", style: "Regular" };
-  list.fontSize = 14;
-  list.lineHeight = { value: 22, unit: "PIXELS" };
-  list.resize(650, 320);
-  list.characters = data.findings
-    .map((finding) => `${finding.id} - ${finding.title}\n${finding.recommendation}`)
-    .join("\n\n");
+  const divider = figma.createLine();
+  divider.name = "Header divider";
+  divider.resize(1224, 0);
+  divider.strokes = [{ type: "SOLID", color: rgb("#e7e5e1") }];
+  report.appendChild(divider);
 
-  report.appendChild(title);
-  report.appendChild(meta);
-  report.appendChild(list);
-  report.x = figma.viewport.center.x - 360;
-  report.y = figma.viewport.center.y - 260;
+  report.appendChild(await makeText("Review summary", { size: 32, bold: true }));
+  report.appendChild(await makeText("UX clarity, missing states, and handoff risks before implementation.", { size: 16, color: "#666666", width: 900 }));
+
+  const summaryRow = makeFrame("Score summary", { width: 1224, fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", padding: 0, gap: 12 });
+  summaryRow.appendChild(await makeSummaryCard("Readiness", `${data.score || 0} / 100`, data.score >= 75 ? "Ready with light improvements before handoff." : "Needs focused improvements before handoff.", 400, {
+    fill: "#f3eee4",
+    stroke: "#ded2bd",
+    dot: "#9a6b2f",
+    label: "#3f3424",
+    value: "#111111",
+    detail: "#5f5446"
+  }));
+  summaryRow.appendChild(await makeSummaryCard("Complexity", data.complexity || "Medium", "Estimated implementation and review effort.", 400, {
+    fill: "#f1f2ee",
+    stroke: "#d7d9cf",
+    dot: "#66705c",
+    label: "#333a2e",
+    value: "#111111",
+    detail: "#535b4b"
+  }));
+  summaryRow.appendChild(await makeSummaryCard("Findings", `${findings.length} total`, `${highCount} high, ${mediumCount} medium, ${lowCount} low`, 400, {
+    fill: "#f4eceb",
+    stroke: "#dfcbc8",
+    dot: "#9d2d25",
+    label: "#442a27",
+    value: "#111111",
+    detail: "#634c49"
+  }));
+  report.appendChild(summaryRow);
+
+  const severity = makeFrame("Severity overview", { width: 1224, fill: "#ffffff", padding: 18, gap: 10 });
+  const severityTop = makeFrame("Severity content", { width: 1188, fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", padding: 0, gap: 24 });
+  severityTop.primaryAxisAlignItems = "SPACE_BETWEEN";
+  const severityCopy = makeFrame("Severity copy", { fill: "#ffffff", stroke: false, radius: 0, padding: 0, gap: 4 });
+  severityCopy.appendChild(await makeText("Severity overview", { size: 15, bold: true }));
+  severityCopy.appendChild(await makeText("Prioritize high-severity findings before handoff.", { size: 13, color: "#666666" }));
+  const severityPills = makeFrame("Severity pills", { fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", counterSizing: "AUTO", padding: 0, gap: 12 });
+  severityPills.appendChild(await makePill(`High ${highCount}`, severityColors("must")));
+  severityPills.appendChild(await makePill(`Medium ${mediumCount}`, severityColors("should")));
+  severityPills.appendChild(await makePill(`Low ${lowCount}`, severityColors("consider")));
+  severityTop.appendChild(severityCopy);
+  severityTop.appendChild(severityPills);
+  severity.appendChild(severityTop);
+  report.appendChild(severity);
+
+  const table = makeFrame("Findings", { width: 1224, fill: "#ffffff", padding: 0, gap: 0 });
+  const tableTitle = makeFrame("Findings title", { width: 1224, fill: "#ffffff", stroke: false, radius: 0, paddingTop: 14, paddingRight: 18, paddingBottom: 14, paddingLeft: 18 });
+  tableTitle.appendChild(await makeText("Findings", { size: 16, bold: true }));
+  table.appendChild(tableTitle);
+  const widths = [120, 250, 300, 360, 194];
+  table.appendChild(await makeFindingRow({}, widths, true));
+  for (const finding of findings.slice(0, 5)) table.appendChild(await makeFindingRow(finding, widths, false));
+  report.appendChild(table);
+
+  const bottom = makeFrame("Bottom sections", { width: 1224, fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", padding: 0, gap: 16 });
+  const states = makeFrame("Missing states", { width: 570, fill: "#ffffff", padding: 18, gap: 6 });
+  states.appendChild(await makeText("Missing states", { size: 16, bold: true }));
+  for (const stateRow of (data.states || []).slice(0, 6)) states.appendChild(await makeStateRow(stateRow));
+
+  const recommendations = makeFrame("Recommendation summary", { width: 638, fill: "#ffffff", padding: 18, gap: 14 });
+  recommendations.appendChild(await makeText("Recommendation summary", { size: 16, bold: true }));
+  const recs = findings.slice(0, 3).map((finding) => finding.recommendation);
+  const fallbackRecs = [
+    "Clarify the primary action and reduce competing CTAs.",
+    "Add missing permission and billing edge states.",
+    "Prepare handoff notes for table filters and state coverage."
+  ];
+  for (let index = 0; index < 3; index += 1) {
+    const rec = recs[index] || fallbackRecs[index];
+    const row = makeFrame(`Recommendation ${index + 1}`, { width: 602, fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", padding: 0, gap: 14 });
+    row.appendChild(await makePill(String(index + 1), { fill: "#f3f2ef", color: "#111111" }));
+    row.appendChild(await makeText(rec, { size: 13, color: "#333333", width: 528, lineHeight: 18 }));
+    recommendations.appendChild(row);
+  }
+
+  bottom.appendChild(states);
+  bottom.appendChild(recommendations);
+  report.appendChild(bottom);
+
+  const footer = makeFrame("Footer", { width: 1224, fill: "#ffffff", stroke: false, radius: 0, layout: "HORIZONTAL", padding: 0, gap: 0 });
+  footer.primaryAxisAlignItems = "SPACE_BETWEEN";
+  footer.appendChild(await makeText("Generated by Meyar Clarity", { size: 11, color: "#666666" }));
+  footer.appendChild(await makeText("Review assists critique and handoff; validate with product context.", { size: 11, color: "#888888", width: 420 }));
+  report.appendChild(footer);
+
+  report.x = figma.viewport.center.x - 640;
+  report.y = figma.viewport.center.y - 450;
   figma.currentPage.appendChild(report);
   figma.currentPage.selection = [report];
   figma.viewport.scrollAndZoomIntoView([report]);
   figma.notify("Meyar Clarity report created.");
 }
-
 figma.ui.postMessage({ type: "selection", payload: getSelectionSummary() });
 
 figma.on("selectionchange", () => {
@@ -533,6 +925,56 @@ figma.on("selectionchange", () => {
 figma.ui.onmessage = async (message) => {
   if (message.type === "get-selection") {
     figma.ui.postMessage({ type: "selection", payload: getSelectionSummary() });
+  }
+
+  if (message.type === "clear-selection") {
+    figma.currentPage.selection = [];
+    figma.ui.postMessage({ type: "selection", payload: getSelectionSummary() });
+  }
+
+  if (message.type === "get-api-key-status") {
+    try {
+      const apiKey = await getStoredApiKey();
+      figma.ui.postMessage({ type: "api-key-status", connected: Boolean(apiKey), message: apiKey ? "API key saved on this device." : "No API key saved yet." });
+    } catch (error) {
+      figma.ui.postMessage({ type: "api-key-status", connected: false, message: "Could not read saved API key. Paste it again to continue." });
+    }
+  }
+
+  if (message.type === "save-api-key") {
+    try {
+      const apiKey = String(message.apiKey || "").trim();
+      if (!apiKey || !apiKey.startsWith("sk-")) {
+        figma.ui.postMessage({ type: "api-key-status", connected: false, message: "Paste a valid OpenAI API key that starts with sk-." });
+        return;
+      }
+      await figma.clientStorage.setAsync("meyar-openai-api-key", apiKey);
+      figma.ui.postMessage({ type: "api-key-status", connected: true, message: "API key saved locally on this device." });
+    } catch (error) {
+      figma.ui.postMessage({ type: "api-key-status", connected: false, message: "Could not save API key. Please try again." });
+    }
+  }
+
+  if (message.type === "clear-api-key") {
+    try {
+      await figma.clientStorage.deleteAsync("meyar-openai-api-key");
+      figma.ui.postMessage({ type: "api-key-status", connected: false, message: "API key removed from this device." });
+    } catch (error) {
+      figma.ui.postMessage({ type: "api-key-status", connected: false, message: "Could not remove saved API key." });
+    }
+  }
+
+  if (message.type === "test-api-key") {
+    try {
+      const apiKey = String(message.apiKey || (await getStoredApiKey()) || "").trim();
+      if (!apiKey || !apiKey.startsWith("sk-")) throw new Error("Paste a valid OpenAI API key first.");
+      const testAudit = runLocalAudit({ strictness: "Light", productType: "SaaS product", userRole: "End user" });
+      await callOpenAI(apiKey, { strictness: "Light", productType: "SaaS product", userRole: "End user" }, testAudit);
+      await figma.clientStorage.setAsync("meyar-openai-api-key", apiKey);
+      figma.ui.postMessage({ type: "api-key-status", connected: true, message: "API key tested successfully." });
+    } catch (error) {
+      figma.ui.postMessage({ type: "api-key-status", connected: false, message: error && error.message ? error.message : "API key test failed." });
+    }
   }
 
   if (message.type === "run-audit") {
@@ -552,3 +994,5 @@ figma.ui.onmessage = async (message) => {
     await createReport(message.data);
   }
 };
+
+

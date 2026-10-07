@@ -1,13 +1,14 @@
 {
   "name": "Meyar Clarity",
-  "id": "meyar-clarity-local",
+  "id": "1689298133254382703",
   "api": "1.0.0",
   "main": "code.js",
   "ui": "ui.html",
   "editorType": ["figma"],
   "documentAccess": "dynamic-page",
   "networkAccess": {
-    "allowedDomains": ["none"],
+    "allowedDomains": ["https://api.openai.com"],
+    "reasoning": "Meyar Clarity connects to OpenAI only when the user chooses Use my API key, saves their own key locally, and starts an AI review.",
     "devAllowedDomains": ["http://localhost:8787"]
   }
 }
